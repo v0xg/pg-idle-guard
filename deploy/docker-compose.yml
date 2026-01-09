@@ -1,0 +1,38 @@
+# Example production docker-compose
+# Copy and modify for your environment
+
+version: '3.8'
+
+services:
+  pguard:
+    build: .
+    # Or use pre-built image once published:
+    # image: ghcr.io/v0xg/pguard:latest
+    restart: unless-stopped
+    environment:
+      # Database connection
+      DATABASE_URL: "postgres://monitoring:${DB_PASSWORD}@your-db-host:5432/yourdb?sslmode=require"
+      
+      # Or individual vars (if not using DATABASE_URL)
+      # PGHOST: your-db-host
+      # PGPORT: 5432
+      # PGDATABASE: yourdb
+      # PGUSER: monitoring
+      # PGPASSWORD: ${DB_PASSWORD}
+      
+      # Slack alerts (optional)
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - pguard-data:/app/data
+    command: ["daemon", "--config", "/app/config.yaml"]
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "pguard", "status", "--config", "/app/config.yaml"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  pguard-data:

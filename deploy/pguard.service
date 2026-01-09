@@ -1,0 +1,33 @@
+[Unit]
+Description=pguard PostgreSQL connection monitor
+Documentation=https://github.com/jc-alvaradov/pg-idle-guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pguard
+Group=pguard
+
+# Configuration
+Environment="DATABASE_URL=postgres://monitoring:password@localhost:5432/mydb"
+# Or use an environment file:
+# EnvironmentFile=/etc/pguard/env
+
+ExecStart=/usr/local/bin/pguard daemon --config /etc/pguard/config.yaml
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/pguard
+
+# Resource limits
+MemoryMax=128M
+CPUQuota=10%
+
+[Install]
+WantedBy=multi-user.target

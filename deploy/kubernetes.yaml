@@ -1,0 +1,144 @@
+---
+# Namespace (optional)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+# ConfigMap for settings
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pguard-config
+  namespace: monitoring
+data:
+  config.yaml: |
+    connection:
+      # Will be overridden by environment variables
+      auth_method: env
+      sslmode: require
+    
+    thresholds:
+      idle_transaction:
+        warning: 30s
+        critical: 2m
+      connection_pool:
+        warning_percent: 75
+        critical_percent: 90
+    
+    polling:
+      interval: 10s
+    
+    alerts:
+      slack:
+        enabled: true
+        channel: "#db-alerts"
+    
+    auto_terminate:
+      enabled: true
+      after: 5m
+      dry_run: false
+      exclude_apps:
+        - pguard
+        - pg_dump
+        - migration
+
+    history:
+      enabled: true
+      storage: /app/data/pguard.db
+      retention: 720h
+    
+    api:
+      enabled: true
+      listen: 0.0.0.0:9182
+---
+# Secret for database credentials
+# In production, use External Secrets, Sealed Secrets, or Vault
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pguard-secrets
+  namespace: monitoring
+type: Opaque
+stringData:
+  DATABASE_URL: "postgres://monitoring:CHANGEME@your-db-host:5432/yourdb?sslmode=require"
+  SLACK_WEBHOOK_URL: "https://hooks.slack.com/services/CHANGEME"
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pguard
+  namespace: monitoring
+  labels:
+    app: pguard
+spec:
+  replicas: 1  # Only one replica needed
+  selector:
+    matchLabels:
+      app: pguard
+  template:
+    metadata:
+      labels:
+        app: pguard
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: pguard
+          image: ghcr.io/v0xg/pguard:latest
+          args: ["daemon", "--config", "/app/config/config.yaml"]
+          envFrom:
+            - secretRef:
+                name: pguard-secrets
+          ports:
+            - containerPort: 9182
+              name: http
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: data
+              mountPath: /app/data
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9182
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9182
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: pguard-config
+        - name: data
+          emptyDir: {}
+---
+# Service for health checks and status API
+apiVersion: v1
+kind: Service
+metadata:
+  name: pguard
+  namespace: monitoring
+  labels:
+    app: pguard
+spec:
+  ports:
+    - port: 9182
+      targetPort: 9182
+      name: http
+  selector:
+    app: pguard

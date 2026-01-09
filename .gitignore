@@ -1,0 +1,30 @@
+# Binaries
+/build/
+/pg-idle-guard
+*.exe
+
+# Test artifacts
+coverage.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependencies
+/vendor/
+
+# Local config (may contain secrets)
+config.yaml
+*.db
+
+# Air (live reload)
+tmp/
+
+CLAUDE.md
