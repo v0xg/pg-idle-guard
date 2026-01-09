@@ -7,7 +7,7 @@ services:
   pguard:
     build: .
     # Or use pre-built image once published:
-    # image: ghcr.io/v0xg/pguard:latest
+    # image: ghcr.io/v0xg/pg-idle-guard:latest
     restart: unless-stopped
     environment:
       # Database connection

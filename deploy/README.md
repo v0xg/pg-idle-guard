@@ -170,7 +170,7 @@ pguard daemon --config /etc/pguard/config.yaml
 {
   "containerDefinitions": [{
     "name": "pguard",
-    "image": "ghcr.io/v0xg/pguard:latest",
+    "image": "ghcr.io/v0xg/pg-idle-guard:latest",
     "command": ["daemon", "--config", "/app/config/config.yaml"]
   }]
 }

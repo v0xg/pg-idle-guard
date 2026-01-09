@@ -51,7 +51,7 @@ go install github.com/v0xg/pg-idle-guard/cmd/pguard@latest
 # https://github.com/v0xg/pg-idle-guard/releases
 
 # Or run with Docker
-docker run -e DATABASE_URL="postgres://..." ghcr.io/v0xg/pguard daemon
+docker run -e DATABASE_URL="postgres://..." ghcr.io/v0xg/pg-idle-guard daemon
 ```
 
 ## Production Deployment
@@ -63,7 +63,7 @@ For production, run as a daemon with alerting:
 docker run -d \
   -e DATABASE_URL="postgres://monitor:pass@db:5432/mydb" \
   -e SLACK_WEBHOOK_URL="https://hooks.slack.com/..." \
-  ghcr.io/v0xg/pguard daemon
+  ghcr.io/v0xg/pg-idle-guard daemon
 
 # Kubernetes
 kubectl apply -f deploy/kubernetes.yaml

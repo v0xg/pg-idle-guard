@@ -87,7 +87,7 @@ spec:
         runAsUser: 1000
       containers:
         - name: pguard
-          image: ghcr.io/v0xg/pguard:latest
+          image: ghcr.io/v0xg/pg-idle-guard:latest
           args: ["daemon", "--config", "/app/config/config.yaml"]
           envFrom:
             - secretRef:
