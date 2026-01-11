@@ -119,6 +119,8 @@ func runConfigure(cmd *cobra.Command, args []string) error {
 	fmt.Println("  1. Password (direct)")
 	fmt.Println("  2. Password from environment variable")
 	fmt.Println("  3. AWS IAM Authentication (for RDS)")
+	fmt.Println("  4. AWS Secrets Manager")
+	fmt.Println("  5. AWS SSM Parameter Store")
 	fmt.Println()
 	fmt.Printf("Select [1]: ")
 
@@ -165,6 +167,46 @@ func runConfigure(cmd *cobra.Command, args []string) error {
 		fmt.Println()
 		fmt.Println("Note: Make sure your database user has the rds_iam role:")
 		fmt.Printf("  GRANT rds_iam TO %s;\n", user)
+	case "4":
+		newCfg.Connection.AuthMethod = "secrets_manager"
+		fmt.Printf("Secrets Manager secret ARN or name: ")
+		secret, secretErr := readLine(reader)
+		if secretErr != nil {
+			return secretErr
+		}
+		if secret == "" {
+			return fmt.Errorf("secret ARN or name is required")
+		}
+		newCfg.Connection.PasswordSecret = secret
+		fmt.Printf("AWS Region [us-east-1]: ")
+		region, regionErr := readLine(reader)
+		if regionErr != nil {
+			return regionErr
+		}
+		if region == "" {
+			region = "us-east-1"
+		}
+		newCfg.Connection.AWSRegion = region
+	case "5":
+		newCfg.Connection.AuthMethod = "parameter_store"
+		fmt.Printf("SSM parameter name (e.g., /myapp/db/password): ")
+		param, paramErr := readLine(reader)
+		if paramErr != nil {
+			return paramErr
+		}
+		if param == "" {
+			return fmt.Errorf("parameter name is required")
+		}
+		newCfg.Connection.PasswordSecret = param
+		fmt.Printf("AWS Region [us-east-1]: ")
+		region, regionErr := readLine(reader)
+		if regionErr != nil {
+			return regionErr
+		}
+		if region == "" {
+			region = "us-east-1"
+		}
+		newCfg.Connection.AWSRegion = region
 	default:
 		return fmt.Errorf("invalid choice: %s", authChoice)
 	}
@@ -272,6 +314,212 @@ func runConfigure(cmd *cobra.Command, args []string) error {
 			channel = "#alerts"
 		}
 		newCfg.Alerts.Slack.Channel = channel
+
+		fmt.Printf("Mention users on critical alerts (comma-separated, optional): ")
+		mentions, mentionErr := readLine(reader)
+		if mentionErr != nil {
+			return mentionErr
+		}
+		if mentions != "" {
+			rawMentions := strings.Split(mentions, ",")
+			for _, mention := range rawMentions {
+				trimmed := strings.TrimSpace(mention)
+				if trimmed != "" {
+					newCfg.Alerts.Slack.MentionUsers = append(newCfg.Alerts.Slack.MentionUsers, trimmed)
+				}
+			}
+		}
+	}
+
+	// Webhook alerts (optional)
+	fmt.Println()
+	fmt.Printf("Configure generic webhook alerts? [y/N]: ")
+	webhookChoice, err := readLine(reader)
+	if err != nil {
+		return err
+	}
+	webhookChoice = strings.ToLower(webhookChoice)
+
+	if webhookChoice == "y" || webhookChoice == "yes" {
+		newCfg.Alerts.Webhook.Enabled = true
+
+		fmt.Printf("Webhook URL: ")
+		webhookURL, urlErr := readLine(reader)
+		if urlErr != nil {
+			return urlErr
+		}
+		newCfg.Alerts.Webhook.URL = webhookURL
+
+		fmt.Printf("HTTP method [POST]: ")
+		method, methodErr := readLine(reader)
+		if methodErr != nil {
+			return methodErr
+		}
+		if method == "" {
+			method = "POST"
+		}
+		newCfg.Alerts.Webhook.Method = strings.ToUpper(method)
+
+		fmt.Printf("Add custom headers? [y/N]: ")
+		headersChoice, headersErr := readLine(reader)
+		if headersErr != nil {
+			return headersErr
+		}
+		headersChoice = strings.ToLower(headersChoice)
+
+		if headersChoice == "y" || headersChoice == "yes" {
+			newCfg.Alerts.Webhook.Headers = make(map[string]string)
+			for {
+				fmt.Printf("Header key (empty to finish): ")
+				key, keyErr := readLine(reader)
+				if keyErr != nil {
+					return keyErr
+				}
+				if key == "" {
+					break
+				}
+				fmt.Printf("Header value: ")
+				value, valueErr := readLine(reader)
+				if valueErr != nil {
+					return valueErr
+				}
+				newCfg.Alerts.Webhook.Headers[key] = value
+			}
+		}
+	}
+
+	// Alert cooldown
+	fmt.Println()
+	fmt.Printf("Alert cooldown [5m]: ")
+	cooldownStr, err := readLine(reader)
+	if err != nil {
+		return err
+	}
+	if cooldownStr != "" {
+		cooldown, parseErr := time.ParseDuration(cooldownStr)
+		if parseErr != nil {
+			return fmt.Errorf("invalid duration: %s", cooldownStr)
+		}
+		newCfg.Alerts.Cooldown = cooldown
+	}
+
+	// Auto-terminate (optional)
+	fmt.Println()
+	fmt.Printf("Enable auto-terminate? [y/N]: ")
+	autoTermChoice, err := readLine(reader)
+	if err != nil {
+		return err
+	}
+	autoTermChoice = strings.ToLower(autoTermChoice)
+
+	if autoTermChoice == "y" || autoTermChoice == "yes" {
+		newCfg.AutoTerm.Enabled = true
+		newCfg.AutoTerm.DryRun = false
+
+		fmt.Printf("Auto-terminate after [5m]: ")
+		autoAfterStr, afterErr := readLine(reader)
+		if afterErr != nil {
+			return afterErr
+		}
+		if autoAfterStr != "" {
+			autoAfter, parseErr := time.ParseDuration(autoAfterStr)
+			if parseErr != nil {
+				return fmt.Errorf("invalid duration: %s", autoAfterStr)
+			}
+			newCfg.AutoTerm.After = autoAfter
+		}
+
+		fmt.Printf("Dry-run only? [y/N]: ")
+		dryRunChoice, dryRunErr := readLine(reader)
+		if dryRunErr != nil {
+			return dryRunErr
+		}
+		dryRunChoice = strings.ToLower(dryRunChoice)
+		if dryRunChoice == "y" || dryRunChoice == "yes" {
+			newCfg.AutoTerm.DryRun = true
+		}
+
+		fmt.Printf("Exclude applications (comma-separated, optional): ")
+		excludeApps, excludeErr := readLine(reader)
+		if excludeErr != nil {
+			return excludeErr
+		}
+		if excludeApps != "" {
+			rawApps := strings.Split(excludeApps, ",")
+			newCfg.AutoTerm.ExcludeApps = nil
+			for _, app := range rawApps {
+				trimmed := strings.TrimSpace(app)
+				if trimmed != "" {
+					newCfg.AutoTerm.ExcludeApps = append(newCfg.AutoTerm.ExcludeApps, trimmed)
+				}
+			}
+		}
+
+		fmt.Printf("Exclude client IPs (comma-separated, optional): ")
+		excludeIPs, excludeIPErr := readLine(reader)
+		if excludeIPErr != nil {
+			return excludeIPErr
+		}
+		if excludeIPs != "" {
+			rawIPs := strings.Split(excludeIPs, ",")
+			for _, ip := range rawIPs {
+				trimmed := strings.TrimSpace(ip)
+				if trimmed != "" {
+					newCfg.AutoTerm.ExcludeIPs = append(newCfg.AutoTerm.ExcludeIPs, trimmed)
+				}
+			}
+		}
+	}
+
+	// HTTP API (optional)
+	fmt.Println()
+	fmt.Printf("Enable HTTP API (/health, /status)? [y/N]: ")
+	apiChoice, err := readLine(reader)
+	if err != nil {
+		return err
+	}
+	apiChoice = strings.ToLower(apiChoice)
+
+	if apiChoice == "y" || apiChoice == "yes" {
+		newCfg.API.Enabled = true
+		fmt.Printf("Listen address [127.0.0.1:9182]: ")
+		listen, listenErr := readLine(reader)
+		if listenErr != nil {
+			return listenErr
+		}
+		if listen == "" {
+			listen = "127.0.0.1:9182"
+		}
+		newCfg.API.Listen = listen
+	}
+
+	// Logging
+	fmt.Println()
+	fmt.Printf("Log level [info]: ")
+	logLevel, levelErr := readLine(reader)
+	if levelErr != nil {
+		return levelErr
+	}
+	if logLevel != "" {
+		newCfg.Logging.Level = strings.ToLower(logLevel)
+	}
+
+	fmt.Printf("Log format (text|json) [text]: ")
+	logFormat, formatErr := readLine(reader)
+	if formatErr != nil {
+		return formatErr
+	}
+	if logFormat != "" {
+		newCfg.Logging.Format = strings.ToLower(logFormat)
+	}
+
+	fmt.Printf("Log output (stderr|stdout|path) [stderr]: ")
+	logOutput, outputErr := readLine(reader)
+	if outputErr != nil {
+		return outputErr
+	}
+	if logOutput != "" {
+		newCfg.Logging.Output = logOutput
 	}
 
 	// Save configuration

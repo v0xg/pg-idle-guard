@@ -104,7 +104,9 @@ The wizard guides you through:
 - Database connection (with IAM auth support for RDS)
 - Credential storage (AWS Secrets Manager, Parameter Store, or environment variables)
 - Alert destinations (Slack or any webhook endpoint)
-- Thresholds and auto-termination rules
+- Alert cooldowns and auto-termination rules
+- HTTP API toggle (`/health`, `/status`) and listen address
+- Logging level, format, and output
 
 Config is stored in `~/.config/pguard/config.yaml`. Secrets stay in your chosen secret manager, never in plain text.
 
