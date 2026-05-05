@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/v0xg/pg-idle-guard/internal/alerts"
 	"github.com/v0xg/pg-idle-guard/internal/config"
@@ -39,14 +40,25 @@ func init() {
 	configureCmd.AddCommand(configureShowCmd)
 }
 
-// readLine reads a line from the reader and returns the trimmed result.
-// Returns an error if reading fails (e.g., stdin closed).
 func readLine(reader *bufio.Reader) (string, error) {
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		return "", fmt.Errorf("reading input: %w", err)
 	}
 	return strings.TrimSpace(line), nil
+}
+
+func readSecret(reader *bufio.Reader) (string, error) {
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		b, err := term.ReadPassword(fd)
+		fmt.Println()
+		if err != nil {
+			return "", fmt.Errorf("reading secret: %w", err)
+		}
+		return string(b), nil
+	}
+	return readLine(reader)
 }
 
 func runConfigure(cmd *cobra.Command, args []string) error {
@@ -136,7 +148,7 @@ func runConfigure(cmd *cobra.Command, args []string) error {
 	case "1":
 		newCfg.Connection.AuthMethod = "password"
 		fmt.Printf("Database password: ")
-		password, pwErr := readLine(reader)
+		password, pwErr := readSecret(reader)
 		if pwErr != nil {
 			return pwErr
 		}
