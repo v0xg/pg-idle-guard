@@ -47,11 +47,9 @@ func runKill(cmd *cobra.Command, args []string) error {
 	}
 	defer client.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Get connection details
-	conns, err := client.GetConnections(ctx)
+	lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	conns, err := client.GetConnections(lookupCtx)
+	lookupCancel() // release immediately; done with DB until after prompt
 	if err != nil {
 		return fmt.Errorf("getting connections: %w", err)
 	}
@@ -116,12 +114,15 @@ func runKill(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Execute termination
+	// Execute termination — fresh context; lookup context may have expired during prompt
+	killCtx, killCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer killCancel()
+
 	var success bool
 	if cancelOnly {
-		success, err = client.CancelBackend(ctx, pid)
+		success, err = client.CancelBackend(killCtx, pid)
 	} else {
-		success, err = client.TerminateBackend(ctx, pid)
+		success, err = client.TerminateBackend(killCtx, pid)
 	}
 
 	if err != nil {

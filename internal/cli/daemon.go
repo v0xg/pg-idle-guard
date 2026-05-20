@@ -3,16 +3,19 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/v0xg/pg-idle-guard/internal/alerts"
+	"github.com/v0xg/pg-idle-guard/internal/config"
 	"github.com/v0xg/pg-idle-guard/internal/postgres"
 	"github.com/v0xg/pg-idle-guard/internal/secrets"
 	"github.com/v0xg/pg-idle-guard/internal/util"
@@ -67,6 +70,12 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
+
+	closeLog, err := setupLogger(&cfg.Logging)
+	if err != nil {
+		return err
+	}
+	defer closeLog()
 
 	// Create PostgreSQL client
 	client, err := postgres.NewClient(cfg)
@@ -485,4 +494,48 @@ func startHTTPServer(listen string, client *postgres.Client) *http.Server {
 	}()
 
 	return server
+}
+
+// setupLogger configures slog based on cfg and returns a cleanup function that
+// closes the log file if one was opened.
+func setupLogger(cfg *config.LoggingConfig) (func(), error) {
+	var w io.Writer
+	cleanup := func() {}
+
+	switch cfg.Output {
+	case "stdout":
+		w = os.Stdout
+	case "", "stderr":
+		w = os.Stderr
+	default:
+		f, err := os.OpenFile(cfg.Output, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("opening log file %s: %w", cfg.Output, err)
+		}
+		w = f
+		cleanup = func() { f.Close() }
+	}
+
+	var level slog.Level
+	switch strings.ToLower(cfg.Level) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+	var handler slog.Handler
+	if strings.ToLower(cfg.Format) == "json" {
+		handler = slog.NewJSONHandler(w, opts)
+	} else {
+		handler = slog.NewTextHandler(w, opts)
+	}
+
+	slog.SetDefault(slog.New(handler))
+	return cleanup, nil
 }
