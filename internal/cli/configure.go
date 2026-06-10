@@ -473,7 +473,7 @@ func runConfigure(cmd *cobra.Command, args []string) error {
 
 	// HTTP API (optional)
 	fmt.Println()
-	fmt.Printf("Enable HTTP API (/health, /status)? [y/N]: ")
+	fmt.Printf("Enable HTTP API (/health, /status, /metrics)? [y/N]: ")
 	apiChoice, err := readLine(reader)
 	if err != nil {
 		return err

@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/v0xg/pg-idle-guard/internal/alerts"
+	"github.com/v0xg/pg-idle-guard/internal/metrics"
 	"github.com/v0xg/pg-idle-guard/internal/postgres"
 	"github.com/v0xg/pg-idle-guard/internal/secrets"
 	"github.com/v0xg/pg-idle-guard/internal/util"
@@ -203,7 +204,9 @@ func monitorLoop(ctx context.Context, client *postgres.Client) error {
 			slog.Info("daemon stopped")
 			return nil
 		case <-ticker.C:
+			metrics.IncPolls()
 			if err := pollAndAlert(ctx, client, tracked); err != nil {
+				metrics.IncPollErrors()
 				slog.Error("polling failed", "error", err)
 			}
 		}
@@ -301,6 +304,7 @@ func pollAndAlert(ctx context.Context, client *postgres.Client, tracked map[int]
 					if success, err := client.TerminateBackend(queryCtx, conn.PID); err != nil {
 						slog.Error("failed to terminate backend", "pid", conn.PID, "error", err)
 					} else if success {
+						metrics.IncTerminations()
 						sendTerminationAlert(conn.PID, conn.ApplicationName, duration, "auto-terminate threshold exceeded")
 					}
 				}
@@ -377,6 +381,7 @@ func shouldTerminate(conn *postgres.Connection, duration time.Duration) bool {
 // Alert helper functions - send to all configured channels
 
 func sendPoolAlert(severity string, used, maxConns int, percent float64) {
+	metrics.IncAlerts(severity)
 	if slackClient != nil {
 		if err := slackClient.ConnectionPoolAlert(severity, used, maxConns, percent); err != nil {
 			slog.Error("failed to send slack alert", "error", err)
@@ -390,6 +395,7 @@ func sendPoolAlert(severity string, used, maxConns int, percent float64) {
 }
 
 func sendIdleTransactionAlert(severity string, pid int, appName string, duration time.Duration, query string) {
+	metrics.IncAlerts(severity)
 	if slackClient != nil {
 		if err := slackClient.IdleTransactionAlert(severity, pid, appName, duration, query); err != nil {
 			slog.Error("failed to send slack alert", "error", err)
@@ -469,6 +475,30 @@ func startHTTPServer(listen string, client *postgres.Client) *http.Server {
 			stats.AvailableConnections,
 			len(idle),
 		)
+	})
+
+	// Prometheus metrics endpoint
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		// On query failure, still serve daemon counters with pguard_up 0 so
+		// Prometheus can alert on database unreachability.
+		stats, err := client.GetPoolStats(ctx)
+		if err != nil {
+			slog.Error("metrics: pool stats query failed", "error", err)
+			stats = nil
+		}
+		var idle []*postgres.Connection
+		if stats != nil {
+			if idle, err = client.GetIdleTransactions(ctx); err != nil {
+				slog.Error("metrics: idle transactions query failed", "error", err)
+				stats = nil
+			}
+		}
+
+		w.Header().Set("Content-Type", metrics.ContentType)
+		fmt.Fprint(w, metrics.Render(stats, idle))
 	})
 
 	server := &http.Server{

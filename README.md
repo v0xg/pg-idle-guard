@@ -105,7 +105,7 @@ The wizard guides you through:
 - Credential storage (AWS Secrets Manager, Parameter Store, or environment variables)
 - Alert destinations (Slack or any webhook endpoint)
 - Alert cooldowns and auto-termination rules
-- HTTP API toggle (`/health`, `/status`) and listen address
+- HTTP API toggle (`/health`, `/status`, Prometheus `/metrics`) and listen address
 - Logging level, format, and output
 
 Config is stored in `~/.config/pguard/config.yaml`. Secrets stay in your chosen secret manager, never in plain text.
@@ -172,6 +172,21 @@ pguard status -q || echo "Database has problems!"
 # Parse JSON output
 pguard status --json | jq '.idle_transactions[] | select(.severity == "critical")'
 ```
+
+## Prometheus
+
+With the HTTP API enabled, the daemon serves Prometheus metrics at `/metrics` —
+point a scrape job at it and graph/alert in your existing Grafana stack:
+
+```
+pguard_connections{state="idle_in_transaction"} 8
+pguard_pool_usage_ratio 0.44
+pguard_idle_transactions{application="payment-api"} 2
+pguard_idle_transaction_oldest_seconds 263
+pguard_terminations_total 5
+```
+
+See [deploy/README.md](deploy/README.md) for scrape config and the full metric list.
 
 ## AWS RDS
 
