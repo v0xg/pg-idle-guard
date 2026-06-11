@@ -3,7 +3,7 @@
 [![CI](https://github.com/v0xg/pg-idle-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/v0xg/pg-idle-guard/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/v0xg/pg-idle-guard)](https://goreportcard.com/report/github.com/v0xg/pg-idle-guard)
 
-Monitor PostgreSQL connections. Catch idle transactions before they kill your database.
+Monitor PostgreSQL connections. Catch idle transactions before they kill your database. Know which service to fix.
 
 ```
 $ pguard status
@@ -35,11 +35,14 @@ You scramble to query `pg_stat_activity` and blindly kill connections. Again.
 
 ## What This Does
 
-- Monitors connections in real-time
-- Alerts before pool exhaustion (Slack, webhooks, or any HTTP endpoint)
-- Identifies which app/query is leaking
-- Terminates stuck transactions safely
-- JSON output and exit codes for scripting/CI integration
+Postgres can already kill idle transactions (`idle_in_transaction_session_timeout`).
+What it can't tell you is which service keeps creating them. pguard does both:
+
+- Names the leaker: every idle transaction with its `application_name`, query, and age
+- Alerts before pool exhaustion — Slack, any webhook, or your Prometheus/Grafana stack
+- Tracks every leak and sends a weekly per-app report: counts, median/max age, top query
+- Terminates stuck transactions safely (opt-in, dry-run by default, exclude lists for migrations)
+- Scripts cleanly: JSON output and meaningful exit codes for CI
 
 ## Install
 
@@ -52,6 +55,25 @@ go install github.com/v0xg/pg-idle-guard/cmd/pguard@latest
 
 # Or run with Docker
 docker run -e DATABASE_URL="postgres://..." ghcr.io/v0xg/pg-idle-guard daemon
+```
+
+## Quick Start
+
+```bash
+# Interactive setup (recommended)
+pguard configure
+
+# Or set connection string directly
+export DATABASE_URL="postgres://user:pass@localhost:5432/mydb"
+
+# Check current status
+pguard status
+
+# Watch in real-time
+pguard watch
+
+# Run as daemon with alerting
+pguard daemon
 ```
 
 ## Production Deployment
@@ -73,25 +95,6 @@ sudo systemctl enable --now pguard
 ```
 
 See [deploy/README.md](deploy/README.md) for detailed deployment options.
-
-## Quick Start
-
-```bash
-# Interactive setup (recommended)
-pguard configure
-
-# Or set connection string directly
-export DATABASE_URL="postgres://user:pass@localhost:5432/mydb"
-
-# Check current status
-pguard status
-
-# Watch in real-time
-pguard watch
-
-# Run as daemon with alerting
-pguard daemon
-```
 
 ## Configuration
 
@@ -168,26 +171,6 @@ report --days 14   Widen the window (up to retention_days)
 report --json      Output as JSON (durations in fractional seconds)
 ```
 
-### Leak Report
-
-With `report.enabled: true`, the daemon records every idle transaction that
-crossed the warning threshold (when it resolves or is terminated) to a local
-JSONL file, and sends a weekly Slack/webhook digest: which apps leaked, how
-often, median/max duration, and the most frequent query. Leaks that are still
-open appear in a separate "ongoing" section so the worst offenders are never
-hidden.
-
-The event file lives on the daemon's filesystem — unlike `status` and `kill`,
-this history is not stored in Postgres. Two consequences:
-
-- **Docker:** mount a volume at the state directory or history is lost on
-  container restart: `-v pguard-state:/home/appuser/.local/state/pguard`
-  (the image runs as `appuser`). On Kubernetes, the bundled manifest already
-  mounts a `data` volume at `/app/data` — set `report.data_file:
-  /app/data/events.jsonl` to use it.
-- **`pguard report`** must run where the daemon writes its state (same host,
-  or with that volume mounted).
-
 ### Exit Codes
 
 The `status` command returns meaningful exit codes:
@@ -202,6 +185,44 @@ pguard status -q || echo "Database has problems!"
 # Parse JSON output
 pguard status --json | jq '.idle_transactions[] | select(.severity == "critical")'
 ```
+
+## Leak Report
+
+Killing a PID treats the symptom. The leak report tells you which service to fix:
+
+```
+$ pguard report
+
+Leak Report — last 7 days
+--------------------------------------------------------------------------------
+APP            LEAKS  MEDIAN  MAX      TERMINATED  TOP QUERY
+payment-api    47     4m 12s  18m 40s  9           UPDATE accounts SET balance = balance...
+user-service   12     1m 3s   7m 55s   0           SELECT * FROM transactions WHERE user...
+order-service  3      52s     2m 30s   0           SELECT * FROM orders WHERE id = $1
+
+Ongoing — 1 still open
+--------------------------------------------------------------------------------
+PID    APP          IDLE FOR  QUERY
+18234  payment-api  6m 2s     UPDATE accounts SET balance = balance...
+```
+
+With `report.enabled: true`, the daemon records every idle transaction that
+crosses the warning threshold and sends this same summary to Slack or your
+webhook once a week (`report.day` / `report.time`). Still-open leaks are
+fetched live into the "ongoing" section, so the worst offenders are never
+hidden. After a week, the conversation changes from "who killed my
+connection?" to "payment-api leaks after every deploy — here's the query."
+
+The event file lives on the daemon's filesystem — unlike `status` and `kill`,
+this history is not stored in Postgres. Two consequences:
+
+- **Docker:** mount a volume at the state directory or history is lost on
+  container restart: `-v pguard-state:/home/appuser/.local/state/pguard`
+  (the image runs as `appuser`). On Kubernetes, the bundled manifest already
+  mounts a `data` volume at `/app/data` — set `report.data_file:
+  /app/data/events.jsonl` to use it.
+- **`pguard report`** must run where the daemon writes its state (same host,
+  or with that volume mounted).
 
 ## Prometheus
 
@@ -237,8 +258,9 @@ Credentials are fetched automatically using your AWS credentials (environment, i
 
 | Alternative | Gap |
 |-------------|-----|
-| `idle_in_transaction_session_timeout` | Blunt. No visibility, no alerting. |
+| `idle_in_transaction_session_timeout` | Blunt. Kills leaks but can't tell you which service keeps creating them. |
 | pgBouncer | Connection pooling does not fix leaked transactions. |
+| postgres_exporter + Grafana | Graphs the counts. No query attribution out of the box, no termination, no leak report. |
 | RDS Performance Insights | Not real-time, harder to action on. |
 | pganalyze | Great but expensive. This is focused and free. |
 
