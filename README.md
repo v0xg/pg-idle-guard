@@ -162,28 +162,13 @@ report:
 configure          Interactive setup wizard
 status             Show current connection pool state
 status --json      Output as JSON (for scripting)
-status -q          Quiet mode (exit code only)
+status -q          Quiet mode (exit code only: 0 healthy, 1 warning, 2 critical)
 watch              Real-time monitoring
 kill <pid>         Terminate a specific backend
 daemon             Run as background service with alerts
 report             Aggregated leaks per application over a trailing window
 report --days 14   Widen the window (up to retention_days)
 report --json      Output as JSON (durations in fractional seconds)
-```
-
-### Exit Codes
-
-The `status` command returns meaningful exit codes:
-- `0` - All healthy
-- `1` - Warning threshold exceeded
-- `2` - Critical threshold exceeded
-
-```bash
-# Use in CI/scripts
-pguard status -q || echo "Database has problems!"
-
-# Parse JSON output
-pguard status --json | jq '.idle_transactions[] | select(.severity == "critical")'
 ```
 
 ## Leak Report
