@@ -7,6 +7,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
+	"sort"
+	"sync"
 	"syscall"
 	"time"
 
@@ -15,12 +18,24 @@ import (
 	"github.com/v0xg/pg-idle-guard/internal/alerts"
 	"github.com/v0xg/pg-idle-guard/internal/metrics"
 	"github.com/v0xg/pg-idle-guard/internal/postgres"
+	"github.com/v0xg/pg-idle-guard/internal/report"
 	"github.com/v0xg/pg-idle-guard/internal/secrets"
 	"github.com/v0xg/pg-idle-guard/internal/util"
 )
 
 var slackClient *alerts.SlackClient
 var webhookClient *alerts.WebhookClient
+
+// reportStore records completed leaks when report.enabled is set; nil otherwise.
+var reportStore *report.Store
+
+// ongoingLeaks is a snapshot of still-open leaks past the warning threshold,
+// rebuilt by the poll loop each cycle and read by the report scheduler — the
+// scheduler never touches the tracked map directly.
+var (
+	ongoingMu    sync.Mutex
+	ongoingLeaks []report.OngoingLeak
+)
 
 // alertCooldown tracks last alert times to prevent spam
 type alertCooldown struct {
@@ -177,9 +192,88 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		cancel()
 	}()
 
+	// Leak report: event recording + weekly digest scheduler
+	if cfg.Report.Enabled {
+		path := cfg.Report.DataFile
+		if path == "" {
+			defaultPath, pathErr := report.DefaultPath()
+			if pathErr != nil {
+				return fmt.Errorf("resolving report data path: %w", pathErr)
+			}
+			path = defaultPath
+		}
+		reportStore = report.NewStore(path)
+
+		day, err := report.ParseWeekday(cfg.Report.Day)
+		if err != nil {
+			return fmt.Errorf("invalid report.day: %w", err)
+		}
+		slog.Info("leak report enabled",
+			"day", cfg.Report.Day,
+			"time", cfg.Report.Time,
+			"retention_days", cfg.Report.RetentionDays,
+			"data_file", path)
+		go runReportScheduler(ctx, reportStore, day)
+	}
+
 	// Main monitoring loop
 	slog.Info("daemon running", "polling_interval", cfg.Polling.Interval)
 	return monitorLoop(ctx, client)
+}
+
+// reportWindowDays is the fixed trailing window of the weekly digest.
+// Retention (report.retention_days) is longer so `pguard report --days` can
+// look further back.
+const reportWindowDays = 7
+
+// runReportScheduler sleeps until the configured weekday+time, sends the
+// digest, prunes old events, and repeats. There is no catch-up: a week where
+// the daemon was down at the scheduled moment is skipped.
+func runReportScheduler(ctx context.Context, store *report.Store, day time.Weekday) {
+	for {
+		next := report.NextRun(time.Now(), day, cfg.Report.Time)
+		slog.Debug("next leak report scheduled", "at", next)
+
+		timer := time.NewTimer(time.Until(next))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		sendLeakReport(store)
+	}
+}
+
+// sendLeakReport reads the trailing window, sends the digest to all
+// configured channels, and prunes events past retention. Each step is
+// best-effort: a failure is logged and the rest still runs.
+func sendLeakReport(store *report.Store) {
+	now := time.Now()
+
+	events, err := store.ReadSince(now.AddDate(0, 0, -reportWindowDays))
+	if err != nil {
+		slog.Error("leak report: reading events failed", "error", err)
+		events = nil
+	}
+	summaries := report.Aggregate(events)
+	ongoing := snapshotOngoing()
+
+	if slackClient != nil {
+		if err := slackClient.LeakReportDigest(summaries, ongoing, reportWindowDays); err != nil {
+			slog.Error("failed to send slack leak report", "error", err)
+		}
+	}
+	if webhookClient != nil {
+		if err := webhookClient.LeakReportDigest(summaries, ongoing, reportWindowDays); err != nil {
+			slog.Error("failed to send webhook leak report", "error", err)
+		}
+	}
+
+	if err := store.Prune(now.AddDate(0, 0, -cfg.Report.RetentionDays)); err != nil {
+		slog.Error("leak report: pruning events failed", "error", err)
+	}
 }
 
 // trackedIdle keeps state for alerting
@@ -188,8 +282,10 @@ type trackedIdle struct {
 	appName      string
 	query        string
 	firstSeen    time.Time
+	maxDuration  time.Duration // max observed idle duration (pg state_change-based)
 	warningSent  bool
 	criticalSent bool
+	terminated   bool // auto-terminated by pguard; event already recorded
 }
 
 func monitorLoop(ctx context.Context, client *postgres.Client) error {
@@ -262,10 +358,13 @@ func pollAndAlert(ctx context.Context, client *postgres.Client, tracked map[int]
 			tc = &trackedIdle{
 				pid:       conn.PID,
 				appName:   conn.ApplicationName,
-				query:     util.TruncateQuery(conn.Query, 100),
+				query:     util.TruncateQuery(conn.Query, report.MaxQueryChars),
 				firstSeen: time.Now(),
 			}
 			tracked[conn.PID] = tc
+		}
+		if duration > tc.maxDuration {
+			tc.maxDuration = duration
 		}
 
 		// Check for warning threshold
@@ -289,7 +388,7 @@ func pollAndAlert(ctx context.Context, client *postgres.Client, tracked map[int]
 		}
 
 		// Auto-terminate if enabled
-		if cfg.AutoTerm.Enabled && duration >= cfg.AutoTerm.After {
+		if cfg.AutoTerm.Enabled && duration >= cfg.AutoTerm.After && !tc.terminated {
 			if shouldTerminate(conn, duration) {
 				if cfg.AutoTerm.DryRun {
 					slog.Info("dry-run: would terminate",
@@ -306,29 +405,93 @@ func pollAndAlert(ctx context.Context, client *postgres.Client, tracked map[int]
 					} else if success {
 						metrics.IncTerminations()
 						sendTerminationAlert(conn.PID, conn.ApplicationName, duration, "auto-terminate threshold exceeded")
+						// Record now and flag the entry; the resolved sweep
+						// still sends ResolvedAlert but must not double-record.
+						recordLeakEvent(tc, true)
+						tc.terminated = true
 					}
 				}
 			}
 		}
 	}
 
-	// Check for resolved transactions
-	for pid, tc := range tracked {
-		if !seenPIDs[pid] {
-			totalDuration := time.Since(tc.firstSeen)
-			slog.Info("idle transaction resolved",
-				"pid", pid,
-				"app", tc.appName,
-				"duration", util.FormatDuration(totalDuration))
-			// Send resolved alert if we had sent warning/critical alerts
-			if tc.warningSent || tc.criticalSent {
-				sendResolvedAlert(pid, tc.appName, totalDuration)
-			}
-			delete(tracked, pid)
-		}
-	}
+	sweepResolved(tracked, seenPIDs)
+	updateOngoing(tracked)
 
 	return nil
+}
+
+// sweepResolved handles PIDs that disappeared since the last poll: it sends
+// the resolved alert and records a leak event for connections that had
+// crossed the warning threshold (unless already recorded at termination).
+func sweepResolved(tracked map[int]*trackedIdle, seenPIDs map[int]bool) {
+	for pid, tc := range tracked {
+		if seenPIDs[pid] {
+			continue
+		}
+		totalDuration := time.Since(tc.firstSeen)
+		slog.Info("idle transaction resolved",
+			"pid", pid,
+			"app", tc.appName,
+			"duration", util.FormatDuration(totalDuration))
+		// Send resolved alert if we had sent warning/critical alerts
+		if tc.warningSent || tc.criticalSent {
+			sendResolvedAlert(pid, tc.appName, totalDuration)
+		}
+		if tc.warningSent && !tc.terminated {
+			recordLeakEvent(tc, false)
+		}
+		delete(tracked, pid)
+	}
+}
+
+// recordLeakEvent appends one completed leak to the report store. Recording
+// is best-effort: failures are logged and must never disrupt monitoring.
+func recordLeakEvent(tc *trackedIdle, terminated bool) {
+	if reportStore == nil {
+		return
+	}
+	e := report.Event{
+		Time:       time.Now(),
+		PID:        tc.pid,
+		App:        tc.appName,
+		Duration:   tc.maxDuration,
+		Query:      tc.query,
+		Terminated: terminated,
+	}
+	if err := reportStore.Append(e); err != nil {
+		slog.Error("failed to record leak event", "pid", tc.pid, "error", err)
+	}
+}
+
+// updateOngoing rebuilds the snapshot of still-open leaks past the warning
+// threshold, oldest first.
+func updateOngoing(tracked map[int]*trackedIdle) {
+	if reportStore == nil {
+		return
+	}
+	leaks := make([]report.OngoingLeak, 0, len(tracked))
+	for _, tc := range tracked {
+		if tc.warningSent && !tc.terminated {
+			leaks = append(leaks, report.OngoingLeak{
+				PID:      tc.pid,
+				App:      tc.appName,
+				Duration: tc.maxDuration,
+				Query:    tc.query,
+			})
+		}
+	}
+	sort.Slice(leaks, func(i, j int) bool { return leaks[i].Duration > leaks[j].Duration })
+
+	ongoingMu.Lock()
+	ongoingLeaks = leaks
+	ongoingMu.Unlock()
+}
+
+func snapshotOngoing() []report.OngoingLeak {
+	ongoingMu.Lock()
+	defer ongoingMu.Unlock()
+	return slices.Clone(ongoingLeaks)
 }
 
 func shouldTerminate(conn *postgres.Connection, duration time.Duration) bool {

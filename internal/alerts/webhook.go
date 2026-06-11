@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/v0xg/pg-idle-guard/internal/report"
 	"github.com/v0xg/pg-idle-guard/internal/util"
 )
 
@@ -102,6 +103,28 @@ func (w *WebhookClient) ResolvedAlert(pid int, appName string, duration time.Dur
 			"application":      appName,
 			"duration_seconds": duration.Seconds(),
 			"duration_human":   duration.Round(time.Second).String(),
+		},
+	}
+	return w.send(payload)
+}
+
+// LeakReportDigest sends the scheduled per-application leak summary.
+// Durations in the payload are fractional seconds, matching the JSONL format.
+func (w *WebhookClient) LeakReportDigest(summaries []report.AppSummary, ongoing []report.OngoingLeak, windowDays int) error {
+	if summaries == nil {
+		summaries = []report.AppSummary{}
+	}
+	if ongoing == nil {
+		ongoing = []report.OngoingLeak{}
+	}
+	payload := WebhookPayload{
+		Event:     "leak_report",
+		Severity:  SeverityInfo,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Data: map[string]interface{}{
+			"window_days": windowDays,
+			"apps":        summaries,
+			"ongoing":     ongoing,
 		},
 	}
 	return w.send(payload)

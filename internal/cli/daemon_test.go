@@ -2,12 +2,14 @@ package cli
 
 import (
 	"bufio"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/v0xg/pg-idle-guard/internal/config"
 	"github.com/v0xg/pg-idle-guard/internal/postgres"
+	"github.com/v0xg/pg-idle-guard/internal/report"
 	"github.com/v0xg/pg-idle-guard/internal/util"
 )
 
@@ -377,5 +379,88 @@ func TestReadLine(t *testing.T) {
 				t.Errorf("readLine() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSweepResolvedRecordsLeakEvents(t *testing.T) {
+	reportStore = report.NewStore(filepath.Join(t.TempDir(), "events.jsonl"))
+	t.Cleanup(func() { reportStore = nil })
+
+	tracked := map[int]*trackedIdle{
+		// Crossed warning and resolved on its own: must be recorded.
+		101: {pid: 101, appName: "payment-api", query: "UPDATE accounts", firstSeen: time.Now(), maxDuration: 4 * time.Minute, warningSent: true},
+		// Auto-terminated: event was already recorded at termination time,
+		// the sweep must not record it again.
+		102: {pid: 102, appName: "batch-job", firstSeen: time.Now(), maxDuration: 10 * time.Minute, warningSent: true, terminated: true},
+		// Never crossed warning: not a reportable leak.
+		103: {pid: 103, appName: "quick-app", firstSeen: time.Now(), maxDuration: 5 * time.Second},
+		// Still present this poll: untouched.
+		104: {pid: 104, appName: "ongoing-app", firstSeen: time.Now(), maxDuration: time.Minute, warningSent: true},
+	}
+
+	sweepResolved(tracked, map[int]bool{104: true})
+
+	if len(tracked) != 1 || tracked[104] == nil {
+		t.Errorf("expected only the seen PID to remain tracked, got %v", tracked)
+	}
+
+	events, err := reportStore.ReadSince(time.Time{})
+	if err != nil {
+		t.Fatalf("reading events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1 (resolved-after-warning only)", len(events))
+	}
+	e := events[0]
+	if e.PID != 101 || e.App != "payment-api" || e.Terminated || e.Duration != 4*time.Minute {
+		t.Errorf("unexpected event: %+v", e)
+	}
+}
+
+func TestRecordLeakEventTerminated(t *testing.T) {
+	reportStore = report.NewStore(filepath.Join(t.TempDir(), "events.jsonl"))
+	t.Cleanup(func() { reportStore = nil })
+
+	tc := &trackedIdle{pid: 7, appName: "a", query: "DELETE", maxDuration: time.Minute}
+	recordLeakEvent(tc, true)
+
+	events, err := reportStore.ReadSince(time.Time{})
+	if err != nil {
+		t.Fatalf("reading events: %v", err)
+	}
+	if len(events) != 1 || !events[0].Terminated {
+		t.Fatalf("expected one terminated event, got %v", events)
+	}
+}
+
+func TestRecordLeakEventNilStore(t *testing.T) {
+	reportStore = nil
+	// Must be a no-op, not a panic, when reporting is disabled.
+	recordLeakEvent(&trackedIdle{pid: 1}, false)
+}
+
+func TestUpdateOngoingSnapshot(t *testing.T) {
+	reportStore = report.NewStore(filepath.Join(t.TempDir(), "events.jsonl"))
+	t.Cleanup(func() {
+		reportStore = nil
+		ongoingMu.Lock()
+		ongoingLeaks = nil
+		ongoingMu.Unlock()
+	})
+
+	tracked := map[int]*trackedIdle{
+		1: {pid: 1, appName: "old", maxDuration: 3 * time.Hour, warningSent: true},
+		2: {pid: 2, appName: "young", maxDuration: time.Minute, warningSent: true},
+		3: {pid: 3, appName: "under-threshold", maxDuration: time.Second},
+		4: {pid: 4, appName: "terminated", maxDuration: time.Hour, warningSent: true, terminated: true},
+	}
+	updateOngoing(tracked)
+
+	got := snapshotOngoing()
+	if len(got) != 2 {
+		t.Fatalf("got %d ongoing leaks, want 2", len(got))
+	}
+	if got[0].App != "old" || got[1].App != "young" {
+		t.Errorf("expected oldest first, got %v", got)
 	}
 }

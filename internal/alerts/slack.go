@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/v0xg/pg-idle-guard/internal/report"
 	"github.com/v0xg/pg-idle-guard/internal/util"
 )
 
@@ -178,6 +180,67 @@ func (s *SlackClient) ResolvedAlert(pid int, appName string, duration time.Durat
 					{Title: "PID", Value: fmt.Sprintf("%d", pid), Short: true},
 					{Title: "Total Duration", Value: duration.Round(time.Second).String(), Short: true},
 				},
+				Footer:    "pguard",
+				Timestamp: time.Now().Unix(),
+			},
+		},
+	}
+
+	return s.send(msg)
+}
+
+// Digest display caps: apps beyond the top maxDigestApps and ongoing leaks
+// beyond maxDigestOngoing are summarized as "…and N more".
+const (
+	maxDigestApps    = 10
+	maxDigestOngoing = 5
+)
+
+// LeakReportDigest sends the scheduled per-application leak summary. It is a
+// digest, not an incident, so it never @-mentions anyone.
+func (s *SlackClient) LeakReportDigest(summaries []report.AppSummary, ongoing []report.OngoingLeak, windowDays int) error {
+	var b strings.Builder
+
+	if len(summaries) == 0 && len(ongoing) == 0 {
+		fmt.Fprintf(&b, "No idle transaction leaks in the last %d days.", windowDays)
+	}
+
+	for i, sum := range summaries {
+		if i == maxDigestApps {
+			fmt.Fprintf(&b, "…and %d more\n", len(summaries)-maxDigestApps)
+			break
+		}
+		fmt.Fprintf(&b, "*%s* — %d leaks, median %s, max %s, %d terminated\n",
+			report.DisplayName(sum.App),
+			sum.Count,
+			util.FormatDuration(sum.MedianDuration),
+			util.FormatDuration(sum.MaxDuration),
+			sum.TerminatedCount)
+		fmt.Fprintf(&b, "        top query: `%s`\n", sum.TopQuery)
+	}
+
+	if len(ongoing) > 0 {
+		if len(summaries) > 0 {
+			b.WriteString("\n")
+		}
+		fmt.Fprintf(&b, "*Ongoing* — %d still open\n", len(ongoing))
+		for i, o := range ongoing {
+			if i == maxDigestOngoing {
+				fmt.Fprintf(&b, "…and %d more\n", len(ongoing)-maxDigestOngoing)
+				break
+			}
+			fmt.Fprintf(&b, "%s — pid %d, idle for %s\n",
+				report.DisplayName(o.App), o.PID, util.FormatDuration(o.Duration))
+		}
+	}
+
+	msg := SlackMessage{
+		Channel: s.Channel,
+		Attachments: []SlackAttachment{
+			{
+				Color:     severityColors[SeverityInfo],
+				Title:     fmt.Sprintf("Weekly Leak Report (last %d days)", windowDays),
+				Text:      strings.TrimRight(b.String(), "\n"),
 				Footer:    "pguard",
 				Timestamp: time.Now().Unix(),
 			},

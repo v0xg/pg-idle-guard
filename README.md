@@ -144,6 +144,13 @@ auto_terminate:
   enabled: true
   after: 5m
   exclude_apps: [migration-runner, pg_dump]
+
+report:
+  enabled: true       # record leaks + send a weekly per-app digest
+  day: monday         # weekday name, case-insensitive
+  time: "09:00"       # 24h HH:MM, local time
+  data_file: ""       # empty = ~/.local/state/pguard/events.jsonl
+  retention_days: 30  # how long events are kept (minimum 7)
 ```
 
 ## Commands
@@ -156,7 +163,30 @@ status -q          Quiet mode (exit code only)
 watch              Real-time monitoring
 kill <pid>         Terminate a specific backend
 daemon             Run as background service with alerts
+report             Aggregated leaks per application over a trailing window
+report --days 14   Widen the window (up to retention_days)
+report --json      Output as JSON (durations in fractional seconds)
 ```
+
+### Leak Report
+
+With `report.enabled: true`, the daemon records every idle transaction that
+crossed the warning threshold (when it resolves or is terminated) to a local
+JSONL file, and sends a weekly Slack/webhook digest: which apps leaked, how
+often, median/max duration, and the most frequent query. Leaks that are still
+open appear in a separate "ongoing" section so the worst offenders are never
+hidden.
+
+The event file lives on the daemon's filesystem — unlike `status` and `kill`,
+this history is not stored in Postgres. Two consequences:
+
+- **Docker:** mount a volume at the state directory or history is lost on
+  container restart: `-v pguard-state:/home/appuser/.local/state/pguard`
+  (the image runs as `appuser`). On Kubernetes, the bundled manifest already
+  mounts a `data` volume at `/app/data` — set `report.data_file:
+  /app/data/events.jsonl` to use it.
+- **`pguard report`** must run where the daemon writes its state (same host,
+  or with that volume mounted).
 
 ### Exit Codes
 

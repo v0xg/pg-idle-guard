@@ -28,8 +28,11 @@ WORKDIR /app
 
 COPY --from=builder /build/pguard /usr/local/bin/pguard
 
-# Non-root user
-RUN adduser -D -u 1000 appuser
+# Non-root user. The state dir must exist with appuser ownership so a named
+# volume mounted there (for leak report history) inherits writable ownership.
+RUN adduser -D -u 1000 appuser \
+    && mkdir -p /home/appuser/.local/state/pguard \
+    && chown -R appuser /home/appuser/.local/state
 USER appuser
 
 ENTRYPOINT ["pguard"]

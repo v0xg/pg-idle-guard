@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/v0xg/pg-idle-guard/internal/report"
 )
 
 // Config holds all configuration for pguard
@@ -18,6 +20,7 @@ type Config struct {
 	AutoTerm   AutoTermConfig   `yaml:"auto_terminate"`
 	API        APIConfig        `yaml:"api"`
 	Logging    LoggingConfig    `yaml:"logging"`
+	Report     ReportConfig     `yaml:"report"`
 }
 
 type ConnectionConfig struct {
@@ -108,6 +111,14 @@ type APIConfig struct {
 	Listen  string `yaml:"listen"`
 }
 
+type ReportConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	Day           string `yaml:"day"`            // weekday name, case-insensitive
+	Time          string `yaml:"time"`           // 24h HH:MM, local time
+	DataFile      string `yaml:"data_file"`      // empty = default XDG state path
+	RetentionDays int    `yaml:"retention_days"` // must cover the 7-day digest window
+}
+
 type LoggingConfig struct {
 	Level  string `yaml:"level"`  // debug, info, warn, error
 	Format string `yaml:"format"` // json, text
@@ -154,6 +165,12 @@ func DefaultConfig() *Config {
 			Level:  "info",
 			Format: "text",
 			Output: "stderr",
+		},
+		Report: ReportConfig{
+			Enabled:       false,
+			Day:           "monday",
+			Time:          "09:00",
+			RetentionDays: 30,
 		},
 	}
 }
@@ -277,6 +294,18 @@ func (c *Config) Validate() error {
 
 	if c.Thresholds.ConnectionPool.WarningPercent >= c.Thresholds.ConnectionPool.CriticalPercent {
 		return fmt.Errorf("connection_pool.warning_percent must be less than critical_percent")
+	}
+
+	if c.Report.Enabled {
+		if _, err := report.ParseWeekday(c.Report.Day); err != nil {
+			return fmt.Errorf("report.day: %w", err)
+		}
+		if _, _, err := report.ParseHHMM(c.Report.Time); err != nil {
+			return fmt.Errorf("report.time: %w", err)
+		}
+		if c.Report.RetentionDays < 7 {
+			return fmt.Errorf("report.retention_days must be at least 7 (the digest window), got %d", c.Report.RetentionDays)
+		}
 	}
 
 	return nil
