@@ -16,8 +16,28 @@ type Config struct {
 	Polling    PollingConfig    `yaml:"polling"`
 	Alerts     AlertsConfig     `yaml:"alerts"`
 	AutoTerm   AutoTermConfig   `yaml:"auto_terminate"`
+	Cloud      CloudConfig      `yaml:"cloud"`
 	API        APIConfig        `yaml:"api"`
 	Logging    LoggingConfig    `yaml:"logging"`
+}
+
+// CloudConfig configures reporting into pguard Cloud. When Enabled, the daemon
+// pushes periodic snapshots and leak events to URL using Token, and long-polls
+// for operator-issued kill commands.
+type CloudConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// URL is the pguard Cloud server root, e.g. https://cloud.pguard.dev.
+	// The "/api/ingest/v1" path prefix is appended internally.
+	URL string `yaml:"url"`
+	// Token is the agent token ("pgc_...") minted in the cloud dashboard.
+	Token string `yaml:"token"`
+	// Instance is the name this daemon reports under. Defaults to the
+	// machine hostname when empty.
+	Instance string `yaml:"instance"`
+	// AllowKill controls whether the daemon executes kill commands pulled
+	// from the cloud. Defaults to true; set false to make the daemon
+	// report kills as unsupported/refused without touching the database.
+	AllowKill bool `yaml:"allow_kill"`
 }
 
 type ConnectionConfig struct {
@@ -146,6 +166,10 @@ func DefaultConfig() *Config {
 			DryRun:      true,
 			ExcludeApps: []string{"pguard", "pg_dump"},
 		},
+		Cloud: CloudConfig{
+			Enabled:   false,
+			AllowKill: true,
+		},
 		API: APIConfig{
 			Enabled: false,
 			Listen:  "127.0.0.1:9182",
@@ -237,6 +261,9 @@ func (c *Config) expandEnvVars() {
 	c.Connection.Database = os.ExpandEnv(c.Connection.Database)
 	c.Alerts.Slack.WebhookURL = os.ExpandEnv(c.Alerts.Slack.WebhookURL)
 	c.Alerts.Webhook.URL = os.ExpandEnv(c.Alerts.Webhook.URL)
+	c.Cloud.URL = os.ExpandEnv(c.Cloud.URL)
+	c.Cloud.Token = os.ExpandEnv(c.Cloud.Token)
+	c.Cloud.Instance = os.ExpandEnv(c.Cloud.Instance)
 }
 
 // ConnectionString builds a PostgreSQL connection string from config
