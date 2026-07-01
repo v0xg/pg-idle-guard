@@ -1,6 +1,3 @@
-# Example production docker-compose
-# Copy and modify for your environment
-
 version: '3.8'
 
 services:

@@ -2,13 +2,17 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -16,6 +20,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/v0xg/pg-idle-guard/internal/alerts"
+	"github.com/v0xg/pg-idle-guard/internal/cloud"
+	"github.com/v0xg/pg-idle-guard/internal/config"
 	"github.com/v0xg/pg-idle-guard/internal/metrics"
 	"github.com/v0xg/pg-idle-guard/internal/postgres"
 	"github.com/v0xg/pg-idle-guard/internal/report"
@@ -25,6 +31,7 @@ import (
 
 var slackClient *alerts.SlackClient
 var webhookClient *alerts.WebhookClient
+var cloudClient *cloud.Client
 
 // reportStore records completed leaks when report.enabled is set; nil otherwise.
 var reportStore *report.Store
@@ -75,14 +82,48 @@ This is the recommended mode for production deployments.`,
 }
 
 func init() {
+	daemonCmd.Flags().String("cloud-url", "", "pguard Cloud server URL; enables cloud reporting (e.g. https://cloud.pguard.dev)")
+	daemonCmd.Flags().String("cloud-token", "", "pguard Cloud agent token (pgc_...); falls back to PGUARD_CLOUD_TOKEN")
+	daemonCmd.Flags().String("cloud-instance", "", "instance name reported to the cloud (default: hostname)")
 	rootCmd.AddCommand(daemonCmd)
 }
 
+// applyCloudFlags folds --cloud-* flags and PGUARD_CLOUD_* env vars into the
+// loaded config. Precedence: flag > config file > env var. Passing --cloud-url
+// (or setting cloud.enabled/url in config, or PGUARD_CLOUD_URL) turns cloud
+// reporting on.
+func applyCloudFlags(cmd *cobra.Command) {
+	if v, _ := cmd.Flags().GetString("cloud-url"); v != "" {
+		cfg.Cloud.URL = v
+	} else if cfg.Cloud.URL == "" {
+		cfg.Cloud.URL = os.Getenv("PGUARD_CLOUD_URL")
+	}
+	if v, _ := cmd.Flags().GetString("cloud-token"); v != "" {
+		cfg.Cloud.Token = v
+	} else if cfg.Cloud.Token == "" {
+		cfg.Cloud.Token = os.Getenv("PGUARD_CLOUD_TOKEN")
+	}
+	if v, _ := cmd.Flags().GetString("cloud-instance"); v != "" {
+		cfg.Cloud.Instance = v
+	}
+	if cfg.Cloud.URL != "" {
+		cfg.Cloud.Enabled = true
+	}
+}
+
 func runDaemon(cmd *cobra.Command, args []string) error {
+	applyCloudFlags(cmd)
+
 	// Validate config
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
+
+	closeLog, err := setupLogger(&cfg.Logging)
+	if err != nil {
+		return err
+	}
+	defer closeLog()
 
 	// Create PostgreSQL client
 	client, err := postgres.NewClient(cfg)
@@ -162,6 +203,25 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if cfg.Cloud.Enabled {
+		if cfg.Cloud.Token == "" {
+			return fmt.Errorf("cloud reporting enabled but no agent token configured (set --cloud-token, cloud.token, or PGUARD_CLOUD_TOKEN)")
+		}
+		instance := cfg.Cloud.Instance
+		if instance == "" {
+			host, hostErr := os.Hostname()
+			if hostErr != nil || host == "" {
+				return fmt.Errorf("cloud instance name not set and hostname unavailable: %w", hostErr)
+			}
+			instance = host
+		}
+		cloudClient = cloud.NewClient(cfg.Cloud.URL, cfg.Cloud.Token, instance, Version)
+		slog.Info("cloud reporting enabled",
+			"url", cfg.Cloud.URL,
+			"instance", instance,
+			"allow_kill", cfg.Cloud.AllowKill)
+	}
+
 	// Handle shutdown signals
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -191,6 +251,11 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 
 		cancel()
 	}()
+
+	// Cloud command poller (kill commands issued from the dashboard).
+	if cloudClient != nil {
+		go cloudCommandLoop(ctx, cloudClient, client)
+	}
 
 	// Leak report: event recording + weekly digest scheduler
 	if cfg.Report.Enabled {
@@ -346,6 +411,10 @@ func pollAndAlert(ctx context.Context, client *postgres.Client, tracked map[int]
 		return err
 	}
 
+	// Push a snapshot to the cloud first, so the instance is registered
+	// before any leak events reference it.
+	pushCloudSnapshot(ctx, stats, conns)
+
 	// Track which PIDs we see
 	seenPIDs := make(map[int]bool)
 
@@ -384,6 +453,7 @@ func pollAndAlert(ctx context.Context, client *postgres.Client, tracked map[int]
 				"app", conn.ApplicationName,
 				"duration", util.FormatDuration(duration))
 			sendIdleTransactionAlert(alerts.SeverityCritical, conn.PID, conn.ApplicationName, duration, conn.Query)
+			pushCloudLeakEvent(ctx, conn, duration, false)
 			tc.criticalSent = true
 		}
 
@@ -405,6 +475,7 @@ func pollAndAlert(ctx context.Context, client *postgres.Client, tracked map[int]
 					} else if success {
 						metrics.IncTerminations()
 						sendTerminationAlert(conn.PID, conn.ApplicationName, duration, "auto-terminate threshold exceeded")
+						pushCloudLeakEvent(ctx, conn, duration, true)
 						// Record now and flag the entry; the resolved sweep
 						// still sends ResolvedAlert but must not double-record.
 						recordLeakEvent(tc, true)
@@ -597,6 +668,155 @@ func sendResolvedAlert(pid int, appName string, duration time.Duration) {
 	}
 }
 
+// pushCloudSnapshot reports the current pool state and idle-in-transaction
+// backends to pguard Cloud. Best-effort: failures are logged, never fatal.
+func pushCloudSnapshot(ctx context.Context, stats *postgres.PoolStats, conns []*postgres.Connection) {
+	if cloudClient == nil {
+		return
+	}
+
+	idleTxs := make([]cloud.IdleTx, 0, len(conns))
+	for _, conn := range conns {
+		idleTxs = append(idleTxs, cloud.IdleTx{
+			PID:       conn.PID,
+			App:       conn.ApplicationName,
+			DurationS: conn.IdleDuration().Seconds(),
+			Query:     util.Truncate(conn.Query, 500),
+		})
+	}
+
+	snap := cloud.Snapshot{
+		DatabaseName: cfg.Connection.Database,
+		IntervalS:    cfg.Polling.Interval.Seconds(),
+		TS:           time.Now().UTC(),
+		Pool: cloud.PoolStats{
+			Active:   stats.ActiveConnections,
+			Idle:     stats.IdleConnections,
+			IdleInTx: stats.IdleInTransaction,
+			MaxConns: stats.MaxConnections,
+		},
+		IdleTxs: idleTxs,
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := cloudClient.PushSnapshot(reqCtx, snap); err != nil {
+		slog.Warn("cloud snapshot push failed", "error", err)
+	}
+}
+
+// pushCloudLeakEvent records a single leak event (a long-lived idle
+// transaction, optionally terminated) with the cloud. Best-effort.
+func pushCloudLeakEvent(ctx context.Context, conn *postgres.Connection, duration time.Duration, terminated bool) {
+	if cloudClient == nil {
+		return
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err := cloudClient.PushEvents(reqCtx, []cloud.LeakEvent{{
+		TS:         time.Now().UTC(),
+		PID:        conn.PID,
+		App:        conn.ApplicationName,
+		DurationS:  duration.Seconds(),
+		Query:      util.Truncate(conn.Query, 500),
+		Terminated: terminated,
+	}})
+	if err != nil {
+		slog.Warn("cloud leak event push failed", "pid", conn.PID, "error", err)
+	}
+}
+
+// cloudCommandLoop long-polls the cloud for commands (kill requests issued from
+// the dashboard) and executes them, reporting each result back. It runs until
+// the context is canceled.
+func cloudCommandLoop(ctx context.Context, cc *cloud.Client, pg *postgres.Client) {
+	slog.Info("cloud command poller started", "instance", cc.Instance())
+	const backoff = 5 * time.Second
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		// The cloud holds the long-poll for ~25s; allow a little longer.
+		pollCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
+		cmds, err := cc.PollCommands(pollCtx)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			// Until the first snapshot registers this instance the cloud
+			// answers 422 "unknown instance"; that is expected startup
+			// state, not a failure worth alarming on.
+			var apiErr *cloud.APIError
+			if errors.As(err, &apiErr) && apiErr.Status == http.StatusUnprocessableEntity {
+				slog.Debug("cloud command poll: instance not registered yet", "error", err)
+			} else {
+				slog.Warn("cloud command poll failed", "error", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			continue
+		}
+
+		for _, cmd := range cmds {
+			handleCloudCommand(ctx, cc, pg, cmd)
+		}
+	}
+}
+
+// handleCloudCommand executes a single command and reports its result. Only
+// "kill" is supported; anything else is reported as failed so the dashboard
+// clearly shows the command was not carried out.
+func handleCloudCommand(ctx context.Context, cc *cloud.Client, pg *postgres.Client, cmd cloud.Command) {
+	report := func(status, message string) {
+		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if err := cc.ReportResult(reqCtx, cmd.ID, status, message); err != nil {
+			slog.Error("cloud command result report failed", "id", cmd.ID, "error", err)
+		}
+	}
+
+	if cmd.Type != "kill" {
+		slog.Warn("unsupported cloud command", "id", cmd.ID, "type", cmd.Type)
+		report("failed", fmt.Sprintf("unsupported command type %q", cmd.Type))
+		return
+	}
+
+	var payload cloud.KillPayload
+	if err := json.Unmarshal(cmd.Payload, &payload); err != nil || payload.PID <= 0 {
+		slog.Warn("invalid kill command payload", "id", cmd.ID)
+		report("failed", "invalid kill payload: expected a positive pid")
+		return
+	}
+
+	if !cfg.Cloud.AllowKill {
+		slog.Warn("refusing cloud kill command; allow_kill is disabled", "id", cmd.ID, "pid", payload.PID)
+		report("failed", "remote termination is disabled on this daemon (cloud.allow_kill=false)")
+		return
+	}
+
+	slog.Warn("executing cloud kill command", "id", cmd.ID, "pid", payload.PID)
+	killCtx, cancel := context.WithTimeout(ctx, cfg.Polling.Timeout)
+	defer cancel()
+	success, err := pg.TerminateBackend(killCtx, payload.PID)
+	switch {
+	case err != nil:
+		slog.Error("cloud kill failed", "id", cmd.ID, "pid", payload.PID, "error", err)
+		report("failed", fmt.Sprintf("pg_terminate_backend(%d) failed: %v", payload.PID, err))
+	case !success:
+		slog.Info("cloud kill: backend not found", "id", cmd.ID, "pid", payload.PID)
+		report("failed", fmt.Sprintf("backend %d not found (already gone)", payload.PID))
+	default:
+		slog.Info("cloud kill succeeded", "id", cmd.ID, "pid", payload.PID)
+		report("done", fmt.Sprintf("terminated backend %d", payload.PID))
+	}
+}
+
 func startHTTPServer(listen string, client *postgres.Client) *http.Server {
 	mux := http.NewServeMux()
 
@@ -678,4 +898,48 @@ func startHTTPServer(listen string, client *postgres.Client) *http.Server {
 	}()
 
 	return server
+}
+
+// setupLogger configures slog based on cfg and returns a cleanup function that
+// closes the log file if one was opened.
+func setupLogger(cfg *config.LoggingConfig) (func(), error) {
+	var w io.Writer
+	cleanup := func() {}
+
+	switch cfg.Output {
+	case "stdout":
+		w = os.Stdout
+	case "", "stderr":
+		w = os.Stderr
+	default:
+		f, err := os.OpenFile(cfg.Output, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("opening log file %s: %w", cfg.Output, err)
+		}
+		w = f
+		cleanup = func() { f.Close() }
+	}
+
+	var level slog.Level
+	switch strings.ToLower(cfg.Level) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+	var handler slog.Handler
+	if strings.EqualFold(cfg.Format, "json") {
+		handler = slog.NewJSONHandler(w, opts)
+	} else {
+		handler = slog.NewTextHandler(w, opts)
+	}
+
+	slog.SetDefault(slog.New(handler))
+	return cleanup, nil
 }
