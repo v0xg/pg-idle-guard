@@ -216,7 +216,29 @@ curl http://localhost:9182/health
 
 # JSON status
 curl http://localhost:9182/status
+
+# Prometheus metrics
+curl http://localhost:9182/metrics
 ```
+
+## Prometheus
+
+The `/metrics` endpoint serves the Prometheus text format, so the daemon can
+be scraped directly — no separate exporter needed:
+
+```yaml
+scrape_configs:
+  - job_name: pguard
+    static_configs:
+      - targets: ["pguard:9182"]
+```
+
+Exposed metrics include connection counts by state (`pguard_connections`),
+pool usage (`pguard_pool_usage_ratio`), idle transactions per application
+(`pguard_idle_transactions{application="..."}`), the age of the oldest idle
+transaction (`pguard_idle_transaction_oldest_seconds`), and daemon counters
+for alerts sent and backends auto-terminated. `pguard_up` reports 0 when the
+database is unreachable.
 
 ## Configuration Reference
 

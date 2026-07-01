@@ -22,6 +22,16 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Thresholds.IdleTransaction.Critical != 2*time.Minute {
 		t.Errorf("expected critical threshold 2m, got %s", cfg.Thresholds.IdleTransaction.Critical)
 	}
+
+	if cfg.Report.Enabled {
+		t.Error("expected report disabled by default")
+	}
+	if cfg.Report.Day != "monday" || cfg.Report.Time != "09:00" {
+		t.Errorf("expected default schedule monday 09:00, got %s %s", cfg.Report.Day, cfg.Report.Time)
+	}
+	if cfg.Report.RetentionDays != 30 {
+		t.Errorf("expected default retention 30 days, got %d", cfg.Report.RetentionDays)
+	}
 }
 
 func TestConfigValidate(t *testing.T) {
@@ -61,6 +71,50 @@ func TestConfigValidate(t *testing.T) {
 				c.Thresholds.IdleTransaction.Critical = 2 * time.Minute
 			},
 			wantErr: true,
+		},
+		{
+			name: "valid: report enabled with defaults",
+			modify: func(c *Config) {
+				c.Connection.Host = "localhost"
+				c.Report.Enabled = true
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid: report bad day",
+			modify: func(c *Config) {
+				c.Connection.Host = "localhost"
+				c.Report.Enabled = true
+				c.Report.Day = "someday"
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid: report bad time",
+			modify: func(c *Config) {
+				c.Connection.Host = "localhost"
+				c.Report.Enabled = true
+				c.Report.Time = "9am"
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid: report retention under digest window",
+			modify: func(c *Config) {
+				c.Connection.Host = "localhost"
+				c.Report.Enabled = true
+				c.Report.RetentionDays = 3
+			},
+			wantErr: true,
+		},
+		{
+			name: "report disabled skips report validation",
+			modify: func(c *Config) {
+				c.Connection.Host = "localhost"
+				c.Report.Day = "someday"
+				c.Report.RetentionDays = 0
+			},
+			wantErr: false,
 		},
 	}
 

@@ -71,7 +71,7 @@ issues:
         - forbidigo
 
     # Allow fmt.Print in CLI commands (user prompts, output formatting)
-    - path: cli/(configure|kill|status|watch|root)\.go
+    - path: cli/(configure|kill|status|watch|root|report)\.go
       linters:
         - forbidigo
 
